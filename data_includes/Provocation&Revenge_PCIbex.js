@@ -83,7 +83,7 @@ Header(
     }).call()
 );
 
-var confirmationLink = "https://app.prolific.com/submissions/complete?cc=CNAM6AA1";
+var confirmationLink = "https://app.prolific.com/submissions/complete?cc=C15N5P0M";
 
 // Fisher-Yates shuffle function for randomization
 function fisherYates(array) {
@@ -609,6 +609,17 @@ Template("dummy", () => {
       .log("german_verb_freq", selectedRow.german_verb_freq)
       .log("german_verb_length", selectedRow.german_verb_length)
       .log("Susanne_avgRating_Score", selectedRow.Susanne_avgRating_Score)
+      .log("q_type", selectedRow.q_type)
+      .log("Intended referent", selectedRow["Intended referent"])
+      .log("intended_answer_text", selectedRow.intended_answer_text)
+      .log("intended_answer_side", selectedRow.intended_answer_side)
+      .log("intended_answer_key", selectedRow.intended_answer_key)
+      .log("correct_response", selectedRow.correct_response)
+      .log("type1_ambiguous", selectedRow.type1_ambiguous)
+      .log("real_NP1_gender", selectedRow.real_NP1_gender)
+      .log("real_NP2_gender", selectedRow.real_NP2_gender)
+      .log("generated_version", selectedRow.generated_version)
+      .log("Causality", selectedRow.Causality)
       .log("story", selectedRow.story)
       .log("question", selectedRow.question)
       .log("correctKey", correctKey)
