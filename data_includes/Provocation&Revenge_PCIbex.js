@@ -10,7 +10,8 @@ window.STUDY_ID = GetURLParameter("STUDY_ID") || "";
 window.SESSION_ID = GetURLParameter("SESSION_ID") || "";
 
 // new: q onset timestamp
-window.__qOnset = window.__qOnset || { practice: {}, critical: {} };
+window.__qOnset = window.__qOnset || { practice: {}, critical: {}, filler: {} };
+window.__qOnset.filler = window.__qOnset.filler || {};
 
 // NEW: whole-experiment timing
 window.__expStart = window.__expStart || Date.now();
@@ -107,9 +108,9 @@ Sequence("consent",
   "instructions", 
   "practice", 
   "go", 
-  "critical_firsthalf", 
+  "experimental_firsthalf", 
   "mid_break", 
-  "critical_secondhalf", 
+  "experimental_secondhalf", 
   "record_critical_time",
   "conclude", "exit", "demo", "debrief", "record_total_time", SendResults(), "submit");
 
@@ -339,16 +340,13 @@ newTrial("go",
 
 
 // ============================================================
-// CRITICAL TRIALS - dynamic Latin-square selection per item
+// EXPERIMENTAL TRIALS - 32 critical verbs alternating with 32 fillers
 // ============================================================
-// New-data assumptions:
-// - item = list_item from the CSV
-// - each item can have N available variants, usually 8
-// - cond_group is no longer assumed to be 1..16
-// - participant is assigned to a list using PROLIFIC_PID
-// - for item index i, choose variant index:
-//       targetIndex = (i + listId) % numberOfVariantsForThisItem
-// - then shuffle trial order after selection
+// The lookup table fixes the 16 NP1-bias and 16 NP2-bias verbs.
+// Critical.csv remains unchanged. At runtime, each selected item contributes
+// either cond_group 1 (NP1 causality) or cond_group 8 (NP2 causality).
+// Both conditions use unambiguous masculine er with mixed-gender referents.
+// Assignment and order are reproducibly randomized from PROLIFIC_PID.
 
 // ---- deterministic hash (string -> uint32) ----
 function hashStringToUint32(str) {
@@ -380,83 +378,182 @@ function fisherYatesSeeded(array, rand) {
   return array;
 }
 
-// Step 1: Read all rows from Critical.csv into a dictionary organized by item
-const criticalItems = {}; // item -> array of rows
+// Step 1: Read the fixed set of 32 verbs from the lookup table.
+const criticalLookup = {}; // list_item -> lookup metadata
 
-Template("Critical.csv", row => {
-  if (criticalItems[row.item] === undefined) {
-    criticalItems[row.item] = [];
+Template("after8_final_32_item_lookup.csv", row => {
+  if (String(row.selected_for_formal_experiment).toLowerCase() === "true") {
+    const itemNumber = String(row.list_item);
+    criticalLookup[itemNumber] = {
+      selectionKey: row.selection_key,
+      expectedVerbBias: row.expected_verb_bias,
+      finalGlobalOrder: Number(row.final_global_order),
+      finalOrderWithinBias: Number(row.final_order_within_bias),
+      lookupVerb: row.verb
+    };
   }
-  criticalItems[row.item].push(row);
   return {};
 });
 
-// Step 2: Dummy table to run selection after CSV is loaded
+// Step 2: Read Critical.csv without changing it. Keep only the 32 lookup items
+// and the two unambiguous mixed-gender conditions with masculine er.
+const eligibleCondGroups = ["1", "8"];
+const criticalItems = {}; // item -> NP1-causality row and NP2-causality row
+
+Template("Critical.csv", row => {
+  const itemNumber = String(row.item);
+  const condGroup = String(row.cond_group);
+
+  if (criticalLookup[itemNumber] && eligibleCondGroups.includes(condGroup)) {
+    if (criticalItems[itemNumber] === undefined) {
+      criticalItems[itemNumber] = [];
+    }
+    criticalItems[itemNumber].push(row);
+  }
+  return {};
+});
+
+// Step 3: Read all 32 fillers. Each participant sees each filler exactly once.
+const fillerRows = [];
+
+Template("after7_Fillers_pcibex.csv", row => {
+  fillerRows.push(row);
+  return {};
+});
+
+// Step 4: Dummy table to run selection after all CSV files are loaded.
 AddTable("dummy", "x\ny");
 
 Template("dummy", () => {
 
   const prolificId = window.PROLIFIC_ID;
 
-  // Use a large list space, but each item will modulo by its own number of variants.
-  // If most items have 8 variants, this effectively gives listId 0..7.
   const globalSeed = hashStringToUint32(prolificId);
-  const rand = mulberry32(globalSeed);
+  // Independent random streams keep condition assignment, item order, filler
+  // order and answer-side randomization reproducible but mutually isolated.
+  const conditionRand = mulberry32(hashStringToUint32(prolificId + "|causality"));
+  const criticalOrderRand = mulberry32(hashStringToUint32(prolificId + "|critical-order"));
+  const fillerOrderRand = mulberry32(hashStringToUint32(prolificId + "|filler-order"));
+  const answerSideRand = mulberry32(hashStringToUint32(prolificId + "|answer-side"));
 
   const itemKeys = Object.keys(criticalItems).sort((a, b) => {
-    const na = Number(a), nb = Number(b);
-    const aIsNum = Number.isFinite(na), bIsNum = Number.isFinite(nb);
-    if (aIsNum && bIsNum) return na - nb;
-    return String(a).localeCompare(String(b));
+    return criticalLookup[a].finalGlobalOrder - criticalLookup[b].finalGlobalOrder;
   });
 
-  // Infer the maximum number of variants across items.
-  // Usually this should be 8 in your new data.
-  const maxVariants = Math.max(
-    ...itemKeys.map(item => criticalItems[item].length)
-  );
+  if (Object.keys(criticalLookup).length !== 32 || itemKeys.length !== 32) {
+    throw new Error(
+      `Expected 32 lookup-selected critical items, found lookup=${Object.keys(criticalLookup).length}, Critical.csv=${itemKeys.length}`
+    );
+  }
 
-  const listId = globalSeed % maxVariants;
+  const lookupBiasCounts = itemKeys.reduce((counts, itemNumber) => {
+    const bias = criticalLookup[itemNumber].expectedVerbBias;
+    counts[bias] = (counts[bias] || 0) + 1;
+    return counts;
+  }, {});
+
+  if (lookupBiasCounts.NP1 !== 16 || lookupBiasCounts.NP2 !== 16) {
+    throw new Error(
+      `Expected 16 NP1-bias and 16 NP2-bias items, found NP1=${lookupBiasCounts.NP1 || 0}, NP2=${lookupBiasCounts.NP2 || 0}`
+    );
+  }
+
+  if (fillerRows.length !== 32 || new Set(fillerRows.map(row => row.item)).size !== 32) {
+    throw new Error(
+      `Expected 32 unique fillers, found rows=${fillerRows.length}, unique_items=${new Set(fillerRows.map(row => row.item)).size}`
+    );
+  }
+
+  // Randomized-block assignment, not a Latin square: within each verb-bias
+  // stratum, randomly assign 8 items to NP1 causality and 8 to NP2 causality.
+  const assignedCondGroup = {};
+  ["NP1", "NP2"].forEach(bias => {
+    const biasItems = itemKeys.filter(
+      itemNumber => criticalLookup[itemNumber].expectedVerbBias === bias
+    );
+    fisherYatesSeeded(biasItems, conditionRand);
+    biasItems.forEach((itemNumber, index) => {
+      assignedCondGroup[itemNumber] = index < 8 ? "1" : "8";
+    });
+  });
 
   // STEP 1: build selected row data first
   const selectedRows = [];
 
   for (let i = 0; i < itemKeys.length; i++) {
     const itemNumber = itemKeys[i];
+    const lookupRow = criticalLookup[itemNumber];
     const rowsForThisItem = criticalItems[itemNumber];
 
-    if (!rowsForThisItem || rowsForThisItem.length === 0) {
-      throw new Error(`No rows found for item=${itemNumber}`);
+    if (!rowsForThisItem || rowsForThisItem.length !== 2) {
+      throw new Error(
+        `Expected two eligible rows (cond_group 1 and 8) for item=${itemNumber}, found ${rowsForThisItem ? rowsForThisItem.length : 0}`
+      );
     }
 
-    // Stable sorting inside each item.
-// In the current Critical.csv, cond_group is the true within-item condition index: 1..8.
-  rowsForThisItem.sort((a, b) => {
-    const ag = Number(a.cond_group);
-    const bg = Number(b.cond_group);
+    rowsForThisItem.sort((a, b) =>
+      eligibleCondGroups.indexOf(String(a.cond_group)) -
+      eligibleCondGroups.indexOf(String(b.cond_group))
+    );
 
-    if (Number.isFinite(ag) && Number.isFinite(bg)) {
-      return ag - bg;
+    for (const candidateRow of rowsForThisItem) {
+      if (String(candidateRow.pronoun).toLowerCase() !== "er") {
+        throw new Error(
+          `Eligible row is not masculine for item=${itemNumber}, cond_group=${candidateRow.cond_group}`
+        );
+      }
+      if (candidateRow.verb_bias !== lookupRow.expectedVerbBias) {
+        throw new Error(
+          `Verb-bias mismatch for item=${itemNumber}: lookup=${lookupRow.expectedVerbBias}, Critical.csv=${candidateRow.verb_bias}`
+        );
+      }
+      const condGroup = String(candidateRow.cond_group);
+      const expectedCausality = condGroup === "1" ? "NP1-Causality" : "NP2-Causality";
+      const expectedNP1Gender = condGroup === "1" ? "male" : "female";
+      const expectedNP2Gender = condGroup === "1" ? "female" : "male";
+      if (
+        candidateRow.Causality !== expectedCausality ||
+        candidateRow.real_NP1_gender !== expectedNP1Gender ||
+        candidateRow.real_NP2_gender !== expectedNP2Gender ||
+        String(candidateRow.type1_ambiguous).toLowerCase() !== "false"
+      ) {
+        throw new Error(
+          `Unexpected causality/gender/ambiguity coding for item=${itemNumber}, cond_group=${condGroup}`
+        );
+      }
     }
 
-    return String(a.cond_group).localeCompare(String(b.cond_group));
-  });
-
-
-    const nVariants = rowsForThisItem.length;
-    const targetIndex = (i + listId) % nVariants;
+    const nVariants = eligibleCondGroups.length;
+    const assignedGroup = assignedCondGroup[itemNumber];
+    const targetIndex = rowsForThisItem.findIndex(
+      row => String(row.cond_group) === assignedGroup
+    );
+    if (targetIndex < 0) {
+      throw new Error(`Assigned cond_group=${assignedGroup} not found for item=${itemNumber}`);
+    }
     const selectedRow = rowsForThisItem[targetIndex];
+    const selectedCondGroup = String(selectedRow.cond_group);
+    const selectedCausality = selectedCondGroup === "1" ? "NP1" : "NP2";
+    const selectedGeneratedVersion = selectedRow.generated_version;
+    const selectedCongruency =
+      lookupRow.expectedVerbBias === selectedCausality ? "congruent" : "incongruent";
 
     selectedRows.push({
       itemNumber,
       selectedRow,
       targetIndex,
-      nVariants
+      nVariants,
+      lookupRow,
+      selectedCausality,
+      selectedGeneratedVersion,
+      selectedCongruency
     });
   }
 
-  // STEP 2: shuffle selected row data
-  fisherYatesSeeded(selectedRows, rand);
+  // Independently randomize critical and filler order. They will be zipped
+  // afterward so every critical is immediately followed by one filler.
+  fisherYatesSeeded(selectedRows, criticalOrderRand);
+  fisherYatesSeeded(fillerRows, fillerOrderRand);
 
   // STEP 3: build trials in final order
   const selectedTrials = [];
@@ -464,14 +561,23 @@ Template("dummy", () => {
   const halfPoint = Math.floor(selectedRows.length / 2);
 
   for (let i = 0; i < selectedRows.length; i++) {
-    const { itemNumber, selectedRow, targetIndex, nVariants } = selectedRows[i];
+    const {
+      itemNumber,
+      selectedRow,
+      targetIndex,
+      nVariants,
+      lookupRow,
+      selectedCausality,
+      selectedGeneratedVersion,
+      selectedCongruency
+    } = selectedRows[i];
 
-    const swapSides = rand() < 0.5;
+    const swapSides = answerSideRand() < 0.5;
     const leftText  = swapSides ? selectedRow.right : selectedRow.left;
     const rightText = swapSides ? selectedRow.left  : selectedRow.right;
     const correctKey = swapSides ? flipCorrectKey(selectedRow.correct) : selectedRow.correct;
 
-    const trialLabel = i < halfPoint ? "critical_firsthalf" : "critical_secondhalf";
+    const trialLabel = i < halfPoint ? "experimental_firsthalf" : "experimental_secondhalf";
 
     const trial = [trialLabel, "PennController", newTrial(
       newFunction("set_critical_start_" + itemNumber, function() {
@@ -585,10 +691,19 @@ Template("dummy", () => {
         .wait()
     )
       .log("PROLIFIC_ID", prolificId)
-      .log("latin_list", listId)
-      .log("latin_target_index", targetIndex)
-      .log("latin_n_variants_for_item", nVariants)
+      .log("trial_type", "critical")
+      .log("randomization_method", "seeded_randomized_block_within_verb_bias")
+      .log("randomization_seed", globalSeed)
+      .log("random_target_index", targetIndex)
+      .log("random_n_variants_for_item", nVariants)
+      .log("lookup_selection_key", lookupRow.selectionKey)
+      .log("lookup_final_global_order", lookupRow.finalGlobalOrder)
+      .log("lookup_order_within_bias", lookupRow.finalOrderWithinBias)
+      .log("lookup_expected_verb_bias", lookupRow.expectedVerbBias)
       .log("selected_cond_group", selectedRow.cond_group)
+      .log("selected_causality", selectedCausality)
+      .log("selected_congruency", selectedCongruency)
+      .log("selected_generated_version", selectedGeneratedVersion)
       .log("adj_amb", selectedRow.adj_amb)
       .log("group", selectedRow.cond_group)
       .log("item", selectedRow.item)
@@ -628,6 +743,7 @@ Template("dummy", () => {
       .log("raw_correct", selectedRow.correct)
       .log("swapSides", swapSides ? 1 : 0)
       .log("critical_position", i + 1)
+      .log("experimental_position", 2 * i + 1)
       .log("critical_half", i < halfPoint ? "first" : "second")
       .log("q_onset_critical_ms", () => window.__qOnset.critical[String(itemNumber)] ?? "")
     ];
@@ -635,12 +751,159 @@ Template("dummy", () => {
     selectedTrials.push(trial);
   }
 
-  window.items = (window.items || []).concat(selectedTrials);
+  // Build one trial per filler, using the same reading and question procedure.
+  const fillerTrials = [];
+
+  for (let i = 0; i < fillerRows.length; i++) {
+    const fillerRow = fillerRows[i];
+    const fillerItem = String(fillerRow.item);
+    const swapSides = answerSideRand() < 0.5;
+    const leftText = swapSides ? fillerRow.right : fillerRow.left;
+    const rightText = swapSides ? fillerRow.left : fillerRow.right;
+    const correctKey = swapSides ? flipCorrectKey(fillerRow.correct) : fillerRow.correct;
+    const trialLabel = i < halfPoint ? "experimental_firsthalf" : "experimental_secondhalf";
+
+    const fillerTrial = [trialLabel, "PennController", newTrial(
+      newText("filler_inst_" + fillerItem, "Drücken Sie die Leertaste, um im Satz fortzufahren.")
+        .cssContainer({"font-size":"24px", "font-style":"italic", "margin-bottom":"1em"})
+        .center()
+        .print(),
+
+      newController("spr_filler_" + fillerItem, "DashedSentence", { s: fillerRow.story })
+        .cssContainer({ width: "100%", "max-width": "1300px", margin: "0 auto" })
+        .center()
+        .log()
+        .print()
+        .wait(),
+
+      clear(),
+
+      newText("preq_text_filler_" + fillerItem, "Bitte warten Sie auf die Frage.")
+        .cssContainer({"font-size":"24px", "font-style":"italic", "margin-bottom":"1em"})
+        .center()
+        .print(),
+
+      newTimer("preq_filler_" + fillerItem, 1000)
+        .start()
+        .wait(),
+
+      clear(),
+
+      newController("Question", {
+        q: fillerRow.question,
+        as: [["F", leftText], ["J", rightText]],
+        randomOrder: false,
+        presentHorizontally: true
+      })
+        .center()
+        .print()
+        .log(),
+
+      newFunction("set_q_onset_filler_" + fillerItem, () => {
+        window.__qOnset.filler[fillerItem] = Date.now();
+      }).call(),
+
+      newText("filler_inst2_" + fillerItem, "Antworten Sie mit den Tasten F und J.")
+        .cssContainer({"margin-top":"2em", "font-size":"24px", "font-style":"italic"})
+        .center()
+        .print(),
+
+      newTimer("timeout_filler_" + fillerItem, 12000)
+        .start(),
+
+      newKey("answer_filler_" + fillerItem, "FJ")
+        .callback(getTimer("timeout_filler_" + fillerItem).stop())
+        .log("first"),
+
+      getTimer("timeout_filler_" + fillerItem).wait(),
+
+      clear(),
+
+      getKey("answer_filler_" + fillerItem)
+        .test.pressed("F")
+        .success(
+          correctKey.includes("F")
+            ? newText("success_f_filler_" + fillerItem, "Richtig!")
+                .css({ "font-size": "24px", "font-weight": "400" })
+                .center()
+                .cssContainer({"line-height":"150%", "margin-bottom":"1em"})
+                .print()
+            : newText("failure_f_filler_" + fillerItem, "Falsch")
+                .css({ "font-size": "24px", "font-weight": "400", "color": "red" })
+                .center()
+                .cssContainer({"color":"red", "line-height":"150%", "margin-bottom":"1em"})
+                .print()
+        )
+        .failure(
+          getKey("answer_filler_" + fillerItem).test.pressed("J")
+            .success(
+              correctKey.includes("J")
+                ? newText("success_j_filler_" + fillerItem, "Richtig!")
+                    .css({ "font-size": "24px", "font-weight": "400" })
+                    .center()
+                    .cssContainer({"line-height":"150%", "margin-bottom":"1em"})
+                    .print()
+                : newText("failure_j_filler_" + fillerItem, "Falsch")
+                    .css({ "font-size": "24px", "font-weight": "400", "color": "red" })
+                    .center()
+                    .cssContainer({"color":"red", "line-height":"150%", "margin-bottom":"1em"})
+                    .print()
+            )
+            .failure(
+              newText("timeout_msg_filler_" + fillerItem, "Die Zeit ist um.")
+                .css({ "font-size": "24px", "font-weight": "400" })
+                .center()
+                .cssContainer({"color":"red", "line-height":"150%", "margin-bottom":"1em"})
+                .print()
+            )
+        ),
+
+      newText("wait_filler_" + fillerItem, "Bitte warten Sie für den nächsten Satz.")
+        .cssContainer({"font-size":"24px", "font-style":"italic", "margin-bottom":"1em"})
+        .center()
+        .print(),
+
+      newTimer("afterQuestion_filler_" + fillerItem, 1000)
+        .start()
+        .wait()
+    )
+      .log("PROLIFIC_ID", prolificId)
+      .log("trial_type", "filler")
+      .log("randomization_method", "seeded_independent_order_then_strict_alternation")
+      .log("randomization_seed", globalSeed)
+      .log("item", fillerRow.item)
+      .log("source_group", fillerRow.source_group)
+      .log("source_item", fillerRow.source_item)
+      .log("q_type", fillerRow.q_type)
+      .log("story", fillerRow.story)
+      .log("question", fillerRow.question)
+      .log("correctKey", correctKey)
+      .log("left", leftText)
+      .log("right", rightText)
+      .log("raw_correct", fillerRow.correct)
+      .log("swapSides", swapSides ? 1 : 0)
+      .log("filler_position", i + 1)
+      .log("experimental_position", 2 * i + 2)
+      .log("experimental_half", i < halfPoint ? "first" : "second")
+      .log("q_onset_filler_ms", () => window.__qOnset.filler[fillerItem] ?? "")
+    ];
+
+    fillerTrials.push(fillerTrial);
+  }
+
+  // Strict C-F-C-F alternation while preserving each independently shuffled order.
+  const interleavedTrials = [];
+  for (let i = 0; i < selectedTrials.length; i++) {
+    interleavedTrials.push(selectedTrials[i]);
+    interleavedTrials.push(fillerTrials[i]);
+  }
+
+  window.items = (window.items || []).concat(interleavedTrials);
   return {};
 });
 
 // ============================================================
-// END OF CRITICAL TRIALS
+// END OF EXPERIMENTAL TRIALS
 // ============================================================
 
 newTrial("mid_break",
